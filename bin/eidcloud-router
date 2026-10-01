@@ -1,0 +1,197 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Lightweight PSR-4 autoloader for standalone CLI execution
+spl_autoload_register(function (string $class) {
+    $prefix = 'EidCloud\\ModelRouter\\';
+    $baseDir = dirname(__DIR__) . '/src/';
+
+    $len = strlen($prefix);
+    if (strncmp($prefix, $class, $len) !== 0) {
+        return;
+    }
+
+    $relativeClass = substr($class, $len);
+    $file = $baseDir . str_replace('\\', '/', $relativeClass) . '.php';
+
+    if (file_exists($file)) {
+        require_once $file;
+    }
+});
+
+use EidCloud\ModelRouter\Router;
+use EidCloud\ModelRouter\Cost\CostEstimator;
+use EidCloud\ModelRouter\Registry\ModelRegistry;
+
+function printUsage(): void
+{
+    $help = <<<HELP
+\033[1;36mEidCloud AI Model Router & Task Classifier (v1.0.0)\033[0m
+Author: Eng. MHD. Shadi AL-Hasan
+
+\033[1mUSAGE:\033[0m
+  php bin/eidcloud-router <command> [arguments] [options]
+
+\033[1mCOMMANDS:\033[0m
+  \033[32mroute <prompt>\033[0m            Classify task, match capabilities, and route to optimal model.
+  \033[32mestimate\033[0m                  Estimate cost and compare models across token workloads.
+  \033[32mlist-models\033[0m               List all registered models and their specifications.
+
+\033[1mOPTIONS:\033[0m
+  \033[33m--json\033[0m                    Output response as structured JSON for API/middleware piping.
+  \033[33m--task="<text>"\033[0m           Task description (used with estimate command).
+  \033[33m--tokens=<int>\033[0m            Total tokens to simulate (used with estimate command).
+  \033[33m--max-latency=<ms>\033[0m        Maximum latency constraint in milliseconds.
+  \033[33m--max-vram=<gb>\033[0m           Maximum VRAM budget constraint in GB.
+  \033[33m-h, --help\033[0m                Display this help screen.
+
+\033[1mEXAMPLES:\033[0m
+  php bin/eidcloud-router route "Write a PHP 8.4 script"
+  php bin/eidcloud-router route "ترجم النص التالي إلى العربية" --json
+  php bin/eidcloud-router estimate --task="Translate text" --tokens=2000
+  php bin/eidcloud-router estimate --tokens=50000 --json
+  php bin/eidcloud-router list-models
+
+HELP;
+    echo $help;
+}
+
+$argv = $_SERVER['argv'] ?? [];
+array_shift($argv); // Remove script name
+
+if (empty($argv) || in_array('-h', $argv, true) || in_array('--help', $argv, true)) {
+    printUsage();
+    exit(0);
+}
+
+$isJson = in_array('--json', $argv, true);
+// Filter out flags from arguments
+$parsedOptions = [];
+$positionalArgs = [];
+
+foreach ($argv as $arg) {
+    if (str_starts_with($arg, '--')) {
+        $clean = substr($arg, 2);
+        if (str_contains($clean, '=')) {
+            [$key, $val] = explode('=', $clean, 2);
+            $parsedOptions[$key] = $val;
+        } else {
+            $parsedOptions[$clean] = true;
+        }
+    } else {
+        $positionalArgs[] = $arg;
+    }
+}
+
+$command = $positionalArgs[0] ?? 'route';
+$router = new Router();
+
+try {
+    switch ($command) {
+        case 'route':
+            $prompt = $positionalArgs[1] ?? ($parsedOptions['prompt'] ?? ($parsedOptions['task'] ?? null));
+            if (empty($prompt)) {
+                fwrite(STDERR, "Error: Prompt or task argument is required.\nUsage: php bin/eidcloud-router route \"<prompt>\"\n");
+                exit(1);
+            }
+
+            $routeOptions = [];
+            if (isset($parsedOptions['max-latency'])) {
+                $routeOptions['max_latency_ms'] = (float)$parsedOptions['max-latency'];
+            }
+            if (isset($parsedOptions['max-vram'])) {
+                $routeOptions['max_vram_gb'] = (float)$parsedOptions['max-vram'];
+            }
+
+            $decision = $router->route($prompt, $routeOptions);
+
+            if ($isJson) {
+                echo json_encode($decision->toArray(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
+            } else {
+                echo "\033[1;32m=== EidCloud AI Model Routing Decision ===\033[0m\n";
+                echo sprintf("Prompt:                \"%s\"\n", (mb_strlen($prompt) > 60 ? mb_substr($prompt, 0, 57) . '...' : $prompt));
+                echo sprintf("Detected Category:     \033[1;33m%s\033[0m (Confidence: %.1f%%)\n", strtoupper($decision->classification->category), $decision->classification->confidence * 100);
+                echo sprintf("Required Capability:   %s\n", $decision->classification->requiredCapability);
+                echo sprintf("Selected Model:        \033[1;36m%s\033[0m (%s)\n", $decision->selectedModel->id, $decision->selectedModel->name);
+                echo sprintf("Provider:              %s\n", $decision->selectedModel->provider);
+                echo sprintf("Type:                  %s\n", $decision->selectedModel->isLocal ? "Local Edge (VRAM: {$decision->selectedModel->vramRequirementGb}GB)" : "Cloud API");
+                echo sprintf("Estimated Latency:     %.1f ms\n", $decision->selectedModel->avgLatencyMs);
+                echo sprintf("Estimated Tokens:      %d input / %d output\n", $decision->costEstimation['input_tokens'], $decision->costEstimation['output_tokens']);
+                echo sprintf("Estimated Cost:        \033[1;32m\$%.7f USD\033[0m\n", $decision->costEstimation['total_cost_usd']);
+                if ($decision->isFallback) {
+                    echo sprintf("Fallback Status:       \033[1;31mACTIVE\033[0m (Switched from %s)\n", $decision->originalModelId);
+                }
+                echo "\nReasoning: " . $decision->reason . "\n";
+            }
+            exit(0);
+
+        case 'estimate':
+            $task = $parsedOptions['task'] ?? ($positionalArgs[1] ?? 'General AI Query');
+            $tokens = isset($parsedOptions['tokens']) ? (int)$parsedOptions['tokens'] : 2000;
+            $inputTokens = (int) ceil($tokens * 0.4);
+            $outputTokens = $tokens - $inputTokens;
+
+            $registry = $router->getRegistry();
+            $estimator = $router->getCostEstimator();
+            $models = array_values($registry->all());
+            $comparisons = $estimator->compare($models, $inputTokens, $outputTokens);
+
+            if ($isJson) {
+                echo json_encode([
+                    'task' => $task,
+                    'input_tokens' => $inputTokens,
+                    'output_tokens' => $outputTokens,
+                    'total_tokens' => $tokens,
+                    'comparisons' => $comparisons,
+                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            } else {
+                echo "\033[1;32m=== EidCloud Cost & Token Workload Comparison ===\033[0m\n";
+                echo sprintf("Task Context:          %s\n", $task);
+                echo sprintf("Simulated Tokens:      %d (%d prompt / %d completion)\n\n", $tokens, $inputTokens, $outputTokens);
+                echo sprintf("%-24s | %-14s | %-12s | %-14s\n", "Model ID", "Provider", "Latency", "Estimated Cost");
+                echo str_repeat("-", 72) . "\n";
+
+                foreach ($comparisons as $item) {
+                    $m = $registry->get($item['model_id']);
+                    $provider = $m ? substr($m->provider, 0, 14) : 'Unknown';
+                    $lat = $m ? sprintf("%.0fms", $m->avgLatencyMs) : 'N/A';
+                    echo sprintf("%-24s | %-14s | %-12s | \033[1;32m\$%-13.6f\033[0m\n", $item['model_id'], $provider, $lat, $item['total_cost_usd']);
+                }
+            }
+            exit(0);
+
+        case 'list-models':
+            $models = $router->getRegistry()->all();
+            if ($isJson) {
+                $out = array_map(fn($m) => $m->toArray(), array_values($models));
+                echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            } else {
+                echo "\033[1;32m=== EidCloud Registered Models ===\033[0m\n";
+                echo sprintf("%-22s | %-16s | %-18s | %-10s\n", "Model ID", "Provider", "Capabilities", "Input/1M");
+                echo str_repeat("-", 74) . "\n";
+                foreach ($models as $m) {
+                    echo sprintf(
+                        "%-22s | %-16s | %-18s | \$%.2f\n",
+                        $m->id,
+                        substr($m->provider, 0, 16),
+                        implode(',', array_slice($m->capabilities, 0, 2)),
+                        $m->inputCostPerMillion
+                    );
+                }
+            }
+            exit(0);
+
+        default:
+            fwrite(STDERR, "Error: Unknown command '{$command}'. Run with --help for usage.\n");
+            exit(1);
+    }
+} catch (Throwable $e) {
+    if ($isJson) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()], JSON_PRETTY_PRINT) . "\n";
+    } else {
+        fwrite(STDERR, "\033[1;31mError:\033[0m " . $e->getMessage() . "\n");
+    }
+    exit(1);
+}

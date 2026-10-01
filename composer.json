@@ -1,0 +1,25 @@
+{
+  "name": "eidcloud/model-router",
+  "description": "Intelligent task classifier and AI model router with cost estimation and capability matching in pure PHP",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Eng. MHD. Shadi AL-Hasan",
+      "role": "Author & Maintainer"
+    }
+  ],
+  "require": {
+    "php": ">=8.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "EidCloud\\ModelRouter\\": "src/"
+    }
+  },
+  "bin": [
+    "bin/eidcloud-router"
+  ],
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}

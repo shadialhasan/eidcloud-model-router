@@ -1,0 +1,12 @@
+{
+  "description": "Intelligent task classifier and AI model router with cost estimation and capability matching in pure PHP",
+  "topics": [
+    "eidcloud",
+    "model-router",
+    "ai-routing",
+    "task-classifier",
+    "cost-optimizer",
+    "llm-router",
+    "php8"
+  ]
+}
